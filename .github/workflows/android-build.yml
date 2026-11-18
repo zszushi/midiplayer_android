@@ -97,6 +97,7 @@ jobs:
           echo "Configured release signing secret is unavailable for this build; generating a temporary CI keystore."
           keytool -genkeypair -v \
             -keystore "$RELEASE_KS" \
+            -storetype JKS \
             -storepass "obsidian_ci_store" \
             -alias "upload" \
             -keypass "obsidian_ci_key" \

@@ -99,16 +99,21 @@ jobs:
 
           RELEASE_KS="${RUNNER_TEMP}/ci-upload-key.jks"
           if [ -n "$SECRET_KEYSTORE_B64" ] && [ -n "$SECRET_STORE_PASS" ] && [ -n "$SECRET_KEY_PASS" ]; then
+            VALIDATION_KS="${RUNNER_TEMP}/validated-upload-key.p12"
             if printf '%s' "$SECRET_KEYSTORE_B64" | tr -d '\n\r ' | base64 -d > "$RELEASE_KS" \
-              && keytool -list -keystore "$RELEASE_KS" -storepass "$SECRET_STORE_PASS" \
-                -alias upload -keypass "$SECRET_KEY_PASS" >/dev/null 2>&1; then
+              && keytool -importkeystore -noprompt \
+                -srckeystore "$RELEASE_KS" -srcstoretype JKS \
+                -srcstorepass "$SECRET_STORE_PASS" -srcalias upload -srckeypass "$SECRET_KEY_PASS" \
+                -destkeystore "$VALIDATION_KS" -deststoretype PKCS12 \
+                -deststorepass validation-only >/dev/null 2>&1; then
+              rm -f "$VALIDATION_KS"
               echo "Using the configured release keystore."
               echo "KEYSTORE_PATH=$RELEASE_KS" >> "$GITHUB_ENV"
               echo "STORE_PASSWORD=$SECRET_STORE_PASS" >> "$GITHUB_ENV"
               echo "KEY_PASSWORD=$SECRET_KEY_PASS" >> "$GITHUB_ENV"
             else
-              echo "Configured release keystore is invalid; generating a temporary CI keystore."
-              rm -f "$RELEASE_KS"
+              echo "Configured release keystore or key password is invalid; generating a temporary CI keystore."
+              rm -f "$RELEASE_KS" "$VALIDATION_KS"
             fi
           fi
 

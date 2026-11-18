@@ -1,0 +1,6 @@
+{
+  "name": "Obsidian Midi",
+  "description": "Ultra-lightweight streaming Black MIDI player and zero-GC SF2/SFZ/Sine synthesizer for Android.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

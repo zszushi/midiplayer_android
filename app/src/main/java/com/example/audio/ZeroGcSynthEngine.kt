@@ -3,7 +3,6 @@ package com.example.audio
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
-import android.os.Build
 import android.os.Process
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
@@ -19,18 +18,20 @@ import kotlin.math.sqrt
 /**
  * Zero-GC Kotlin Software Synthesizer designed specifically for extreme Black MIDI polyphony.
  *
- * Key Architecture Decisions:
+ * Anti-Crackle & Overload Architecture:
  * 1. Structure-of-Arrays (SoA) primitive voice pool (FloatArray / IntArray) — zero heap allocations
  *    on the real-time audio thread.
- * 2. Lock-free Single-Producer Single-Consumer (SPSC) packed 64-bit Long ring buffer for MIDI events.
- * 3. Active compact voice index list (O(activeVoices) cache-coherent mixing with O(1) swap-remove).
- * 4. Per-(Channel, Key) polyphony limiter with micro-fade voice stealing to prevent comb-filtering
- *    and voice starvation during 10,000+ NPS Black MIDI cascades.
- * 5. Pre-computed Sine LUT + Linear-interpolated SF2/SFZ PCM synthesis + Soft-knee brickwall limiter.
+ * 2. Intrusive O(1) per-(Channel, Key) doubly-linked voice lists — eliminates O(N) scans during
+ *    dense Note-On/Note-Off cascades.
+ * 3. O(1) 12-probe clock tournament voice stealing paired with a 64-sample sum-of-steps de-click
+ *    ramp buffer so voice eviction never causes step-discontinuity buzz/clicks.
+ * 4. Per-sample smoothed master gain + soft-knee brickwall limiter (zero block-boundary zipper noise).
+ * 5. Real-time Adaptive CPU Overload Guard + cushioned media AudioTrack buffer so CPU spikes shed
+ *    quiet release tails gracefully before AudioFlinger can ever underrun ("バリバリ" prevention).
  */
 class ZeroGcSynthEngine(
   val sampleRate: Int = 44100,
-  private val blockFrames: Int = 256,
+  private val blockFrames: Int = 512,
 ) {
   companion object {
     const val MAX_VOICE_CAPACITY = 4096
@@ -39,6 +40,8 @@ class ZeroGcSynthEngine(
 
     private const val SINE_LUT_SIZE = 4096
     private const val SINE_LUT_MASK = SINE_LUT_SIZE - 1
+    private const val DECLICK_RAMP_FRAMES = 64
+    private const val STEAL_TOURNAMENT_PROBES = 12
 
     const val CMD_NOTE_ON = 1
     const val CMD_NOTE_OFF = 2
@@ -80,7 +83,10 @@ class ZeroGcSynthEngine(
   @Volatile var sineRichHarmonics: Boolean = true
   @Volatile var masterGain: Float = 1.0f
 
-  // Live Telemetry (read by UI at ~16-30Hz without locking)
+  // Adaptive CPU Overload Ceiling (dynamically lowers under heavy DSP load to prevent AudioTrack underruns)
+  @Volatile private var dynamicPolyphonyCap: Int = MAX_VOICE_CAPACITY
+
+  // Live Telemetry (read by UI at ~20Hz without locking)
   @Volatile var activeVoiceCountTelemetry: Int = 0
     private set
   @Volatile var peakLevelLeft: Float = 0f
@@ -90,6 +96,8 @@ class ZeroGcSynthEngine(
   @Volatile var limiterActiveTelemetry: Boolean = false
     private set
   @Volatile var audioCpuLoadPercent: Int = 0
+    private set
+  @Volatile var cpuGuardActiveTelemetry: Boolean = false
     private set
 
   // Pre-computed Sine & Harmonic Pluck LUTs
@@ -119,10 +127,9 @@ class ZeroGcSynthEngine(
   private val freeSlots = IntArray(MAX_VOICE_CAPACITY) { MAX_VOICE_CAPACITY - 1 - it }
   private var activeCount = 0
   private var freeCount = MAX_VOICE_CAPACITY
+  private var stealClock = 0
 
   private val vChannelKey = IntArray(MAX_VOICE_CAPACITY) // (channel shl 7) or key
-  private val vAge = LongArray(MAX_VOICE_CAPACITY)
-  private var ageCounter = 1L
 
   private val vIsSine = BooleanArray(MAX_VOICE_CAPACITY)
   private val vBufferIndex = IntArray(MAX_VOICE_CAPACITY)
@@ -144,15 +151,27 @@ class ZeroGcSynthEngine(
 
   private val vGainL = FloatArray(MAX_VOICE_CAPACITY)
   private val vGainR = FloatArray(MAX_VOICE_CAPACITY)
+  private val vLastOutL = FloatArray(MAX_VOICE_CAPACITY)
+  private val vLastOutR = FloatArray(MAX_VOICE_CAPACITY)
 
-  // Per-(channel, key) non-releasing voice counters (16 * 128 = 2048 entries)
+  // Intrusive O(1) Doubly-Linked List per (channel, key) [0..2047] for non-releasing voices
   private val keyActiveCounts = IntArray(2048)
+  private val keyHeadSlot = IntArray(2048) { -1 } // Oldest active voice on (channel, key)
+  private val keyTailSlot = IntArray(2048) { -1 } // Newest active voice on (channel, key)
+  private val vPrevInKey = IntArray(MAX_VOICE_CAPACITY) { -1 }
+  private val vNextInKey = IntArray(MAX_VOICE_CAPACITY) { -1 }
+  private val vInKeyList = BooleanArray(MAX_VOICE_CAPACITY)
+
+  // Sum-of-steps anti-click ramp state & per-sample smoothed post-gain
+  private var pendingDeclickL = 0f
+  private var pendingDeclickR = 0f
+  private var smoothedPostGain = -1f
 
   // Mixing Scratch Buffers (allocated once)
-  private val mixLeft = FloatArray(blockFrames)
-  private val mixRight = FloatArray(blockFrames)
+  private var mixLeft = FloatArray(max(blockFrames, 512))
+  private var mixRight = FloatArray(max(blockFrames, 512))
   private val interleavedOut = FloatArray(blockFrames * 2)
-  private val fastKillDec = 1.0f / (sampleRate * 0.0025f).coerceAtLeast(8f)
+  private val fastKillDec = 1.0f / (sampleRate * 0.003f).coerceAtLeast(12f)
 
   // Audio Thread Management
   @Volatile private var running = false
@@ -169,9 +188,6 @@ class ZeroGcSynthEngine(
     val w = writeIndex.get()
     val r = readIndex.get()
     if (w - r >= EVENT_RING_SIZE - 1) {
-      // Ring full under extreme burst: drop non-critical Note-On, never drop AllNotesOff
-      val cmd = ((packedEvent ushr 24) and 0xFFL).toInt()
-      if (cmd == CMD_NOTE_ON) return false
       return false
     }
     eventRing[w and EVENT_RING_MASK] = packedEvent
@@ -203,6 +219,7 @@ class ZeroGcSynthEngine(
     activeVoiceCountTelemetry = 0
     peakLevelLeft = 0f
     peakLevelRight = 0f
+    cpuGuardActiveTelemetry = false
   }
 
   private fun runAudioLoop() {
@@ -212,11 +229,20 @@ class ZeroGcSynthEngine(
       // Ignore on JVM unit tests
     }
 
+    val bytesPerFrame = 2 * 4 // Stereo PCM_FLOAT
     val minBufBytes = AudioTrack.getMinBufferSize(
       sampleRate,
       AudioFormat.CHANNEL_OUT_STEREO,
       AudioFormat.ENCODING_PCM_FLOAT,
-    ).coerceAtLeast(blockFrames * 8 * 2)
+    ).coerceAtLeast(blockFrames * bytesPerFrame * 2)
+
+    // Use a cushioned ~105ms media streaming buffer (without LOW_LATENCY fast-mixer starvation)
+    // so transient Black MIDI bursts or OS thread scheduling jitter never cause "バリバリ" underruns.
+    val targetBufBytes = maxOf(
+      minBufBytes * 4,
+      (sampleRate / 9) * bytesPerFrame,
+      blockFrames * bytesPerFrame * 8,
+    )
 
     val trackBuilder = AudioTrack.Builder()
       .setAudioAttributes(
@@ -232,12 +258,8 @@ class ZeroGcSynthEngine(
           .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
           .build()
       )
-      .setBufferSizeInBytes(minBufBytes * 2)
+      .setBufferSizeInBytes(targetBufBytes)
       .setTransferMode(AudioTrack.MODE_STREAM)
-
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-      trackBuilder.setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
-    }
 
     val audioTrack = try {
       trackBuilder.build()
@@ -250,14 +272,30 @@ class ZeroGcSynthEngine(
       audioTrack.play()
       val blockBudgetNs = (blockFrames * 1_000_000_000L) / sampleRate
       var smoothCpu = 0f
+      var overloadHoldBlocks = 0
+      dynamicPolyphonyCap = MAX_VOICE_CAPACITY
 
       while (running) {
         val t0 = System.nanoTime()
         renderBlock(interleavedOut, blockFrames)
         val elapsedNs = System.nanoTime() - t0
-        val loadPct = ((elapsedNs.toFloat() / blockBudgetNs.toFloat()) * 100f).coerceIn(0f, 100f)
-        smoothCpu = smoothCpu * 0.88f + loadPct * 0.12f
+        val rawLoadPct = ((elapsedNs.toFloat() / blockBudgetNs.toFloat()) * 100f).coerceIn(0f, 200f)
+        smoothCpu = smoothCpu * 0.85f + rawLoadPct.coerceAtMost(100f) * 0.15f
         audioCpuLoadPercent = smoothCpu.toInt()
+
+        // Adaptive Real-Time CPU Overload Guard:
+        // Shed quiet release/sustain voices BEFORE render time reaches 100% of blockBudgetNs!
+        val userMax = maxPolyphony.coerceIn(64, MAX_VOICE_CAPACITY)
+        if (rawLoadPct > 74f) {
+          val curBase = min(userMax, min(dynamicPolyphonyCap, activeCount.coerceAtLeast(64)))
+          dynamicPolyphonyCap = max(48, (curBase * 0.80f).toInt())
+          overloadHoldBlocks = 24
+        } else if (overloadHoldBlocks > 0) {
+          overloadHoldBlocks--
+        } else if (smoothCpu < 52f && dynamicPolyphonyCap < MAX_VOICE_CAPACITY) {
+          dynamicPolyphonyCap = min(MAX_VOICE_CAPACITY, dynamicPolyphonyCap + 24)
+        }
+        cpuGuardActiveTelemetry = dynamicPolyphonyCap < userMax && activeCount >= dynamicPolyphonyCap - 8
 
         val written = audioTrack.write(interleavedOut, 0, blockFrames * 2, AudioTrack.WRITE_BLOCKING)
         if (written < 0) break
@@ -277,6 +315,11 @@ class ZeroGcSynthEngine(
    * Public/internal for deterministic zero-GC unit & Robolectric testing without an emulator.
    */
   internal fun renderBlock(outInterleaved: FloatArray, frames: Int) {
+    if (mixLeft.size < frames) {
+      mixLeft = FloatArray(frames)
+      mixRight = FloatArray(frames)
+    }
+
     // Check if SoundBank swapped
     val latestBank = soundBankRef.get()
     if (latestBank !== currentBankSnapshot) {
@@ -284,24 +327,53 @@ class ZeroGcSynthEngine(
       currentBankSnapshot = latestBank
     }
 
-    // Drain SPSC MIDI event ring
+    val effectiveCap = min(maxPolyphony.coerceIn(32, MAX_VOICE_CAPACITY), dynamicPolyphonyCap)
+      .coerceIn(32, MAX_VOICE_CAPACITY)
+
+    // Drain SPSC MIDI event ring with extreme-burst Note-On surge protection
     var r = readIndex.get()
     val w = writeIndex.get()
+    val maxNoteOnWindow = effectiveCap * 2
     while (r != w) {
       val ev = eventRing[r and EVENT_RING_MASK]
-      processEvent(ev)
+      val remaining = w - r
+      if (remaining > maxNoteOnWindow) {
+        val cmd = ((ev ushr 24) and 0xFFL).toInt()
+        val vel = (ev and 0xFFFFL).toInt()
+        // Under a massive >2x-polyphony single-block burst, skip older low/mid Note-Ons while
+        // preserving 100% of Note-Offs, CC, Program Change, and Pitch Bend state transitions.
+        if (cmd == CMD_NOTE_ON && vel in 1..95) {
+          r++
+          continue
+        }
+      }
+      processEvent(ev, effectiveCap)
       r++
     }
     readIndex.lazySet(r)
 
-    // Enforce live maxPolyphony reduction if user dragged slider down
-    val cap = maxPolyphony.coerceIn(16, MAX_VOICE_CAPACITY)
-    while (activeCount > cap) {
+    // Enforce live polyphony & adaptive overload cap cleanly via de-clicked voice eviction
+    while (activeCount > effectiveCap) {
       stealBestCandidateVoice(forceImmediate = true)
     }
 
     mixLeft.fill(0f, 0, frames)
     mixRight.fill(0f, 0, frames)
+
+    // Apply 64-sample linear anti-click fade for all voices immediately evicted prior to this block
+    if (abs(pendingDeclickL) > 1e-6f || abs(pendingDeclickR) > 1e-6f) {
+      val rampLen = min(frames, DECLICK_RAMP_FRAMES)
+      val invRamp = 1.0f / rampLen.toFloat()
+      val dcL = pendingDeclickL
+      val dcR = pendingDeclickR
+      for (f in 0 until rampLen) {
+        val weight = 1.0f - (f.toFloat() * invRamp)
+        mixLeft[f] += dcL * weight
+        mixRight[f] += dcR * weight
+      }
+      pendingDeclickL = 0f
+      pendingDeclickR = 0f
+    }
 
     val bank = currentBankSnapshot
     val sampleBuffers = bank.sampleBuffers
@@ -312,6 +384,9 @@ class ZeroGcSynthEngine(
       val slot = activeSlots[idx]
       var stage = vEnvStage[slot]
       if (stage == ENV_OFF) {
+        unlinkVoiceFromKeyList(slot)
+        vLastOutL[slot] = 0f
+        vLastOutR[slot] = 0f
         releaseSlotAt(idx)
         continue
       }
@@ -329,6 +404,7 @@ class ZeroGcSynthEngine(
       val gR = vGainR[slot]
 
       var voiceFinished = false
+      var lastSample = 0f
 
       if (vIsSine[slot]) {
         for (f in 0 until frames) {
@@ -374,6 +450,7 @@ class ZeroGcSynthEngine(
           val s0 = sineLut[posInt and SINE_LUT_MASK]
           val s1 = sineLut[(posInt + 1) and SINE_LUT_MASK]
           val sample = (s0 + (s1 - s0) * posFrac) * env
+          lastSample = sample
           mixLeft[f] += sample * gL
           mixRight[f] += sample * gR
 
@@ -385,6 +462,9 @@ class ZeroGcSynthEngine(
       } else {
         val bufIdx = vBufferIndex[slot]
         if (bufIdx !in sampleBuffers.indices) {
+          unlinkVoiceFromKeyList(slot)
+          vLastOutL[slot] = 0f
+          vLastOutR[slot] = 0f
           releaseSlotAt(idx)
           continue
         }
@@ -449,6 +529,7 @@ class ZeroGcSynthEngine(
           val nextIdx = if (isLoopActive && posInt + 1 >= loopEnd) loopStart else min(posInt + 1, endFrame - 1)
           val s1 = pcm.get(nextIdx) * (1f / 32768f)
           val sample = (s0 + (s1 - s0) * posFrac) * env
+          lastSample = sample
           mixLeft[f] += sample * gL
           mixRight[f] += sample * gR
 
@@ -460,9 +541,9 @@ class ZeroGcSynthEngine(
       }
 
       if (voiceFinished) {
-        if (stage != ENV_RELEASE && stage != ENV_FAST_KILL) {
-          decrementKeyCount(vChannelKey[slot])
-        }
+        unlinkVoiceFromKeyList(slot)
+        vLastOutL[slot] = 0f
+        vLastOutR[slot] = 0f
         vEnvStage[slot] = ENV_OFF
         releaseSlotAt(idx)
       } else {
@@ -470,13 +551,17 @@ class ZeroGcSynthEngine(
         vPosFrac[slot] = posFrac
         vEnvStage[slot] = stage
         vEnvLevel[slot] = env
+        vLastOutL[slot] = lastSample * gL
+        vLastOutR[slot] = lastSample * gR
         idx++
       }
     }
 
-    // Master Gain + Auto Polyphony Headroom + Brickwall Soft-Knee Limiter
-    val voiceNorm = 1.0f / sqrt(max(4f, activeCount * 0.45f))
-    val postGain = masterGain * voiceNorm
+    // Per-sample smoothed Master Gain + Auto Polyphony Headroom + Soft-Knee Brickwall Limiter
+    val voiceNorm = 1.0f / sqrt(max(4f, activeCount * 0.48f))
+    val targetPostGain = masterGain * voiceNorm
+    var curGain = if (smoothedPostGain < 0f) targetPostGain else smoothedPostGain
+    val gainSmoothCoeff = 0.008f
     val useLimiter = limiterEnabled
     var maxL = 0f
     var maxR = 0f
@@ -484,8 +569,9 @@ class ZeroGcSynthEngine(
 
     var outIdx = 0
     for (f in 0 until frames) {
-      var l = mixLeft[f] * postGain
-      var rCh = mixRight[f] * postGain
+      curGain += (targetPostGain - curGain) * gainSmoothCoeff
+      var l = mixLeft[f] * curGain
+      var rCh = mixRight[f] * curGain
 
       if (useLimiter) {
         if (abs(l) > 0.85f || abs(rCh) > 0.85f) limited = true
@@ -504,6 +590,7 @@ class ZeroGcSynthEngine(
       outInterleaved[outIdx++] = l
       outInterleaved[outIdx++] = rCh
     }
+    smoothedPostGain = curGain
 
     activeVoiceCountTelemetry = activeCount
     peakLevelLeft = max(maxL, peakLevelLeft * 0.82f)
@@ -518,7 +605,7 @@ class ZeroGcSynthEngine(
     return (x * (27f + x2)) / (27f + 9f * x2)
   }
 
-  private fun processEvent(ev: Long) {
+  private fun processEvent(ev: Long, effectiveCap: Int) {
     val cmd = ((ev ushr 24) and 0xFFL).toInt()
     val ch = ((ev ushr 16) and 0x0FL).toInt()
     val d1 = ((ev ushr 8) and 0xFFL).toInt()
@@ -529,14 +616,13 @@ class ZeroGcSynthEngine(
         if (d2 == 0) {
           handleNoteOff(ch, d1)
         } else {
-          handleNoteOn(ch, d1, d2 and 0x7F)
+          handleNoteOn(ch, d1, d2 and 0x7F, effectiveCap)
         }
       }
       CMD_NOTE_OFF -> handleNoteOff(ch, d1)
       CMD_PROGRAM_CHANGE -> chProgram[ch] = d1 and 0x7F
       CMD_CONTROL_CHANGE -> handleControlChange(ch, d1, d2 and 0x7F)
       CMD_PITCH_BEND -> {
-        // d2 is 14-bit unsigned (0..16383, center 8192), standard +/- 2 semitones
         val semis = ((d2 - 8192) / 8192f) * 2.0f
         chPitchBendSemis[ch] = semis
         chPitchRatio[ch] = 2.0.pow(semis / 12.0).toFloat()
@@ -580,14 +666,14 @@ class ZeroGcSynthEngine(
     }
   }
 
-  private fun handleNoteOn(ch: Int, key: Int, velocity: Int) {
+  private fun handleNoteOn(ch: Int, key: Int, velocity: Int, effectiveCap: Int) {
     if (key !in 0..127) return
     if (velocity < velocityThreshold) return
 
     val chKey = (ch shl 7) or key
     val perKeyCap = maxVoicesPerKey.coerceIn(1, 16)
-    if (keyActiveCounts[chKey] >= perKeyCap) {
-      fastKillOldestVoiceOnKey(chKey)
+    while (keyActiveCounts[chKey] >= perKeyCap) {
+      if (!fastKillOldestVoiceOnKey(chKey)) break
     }
 
     val bank = currentBankSnapshot
@@ -596,9 +682,8 @@ class ZeroGcSynthEngine(
     if (velGain <= 0.0002f) return
 
     if (bank.type == SoundBankType.SINE) {
-      val slot = acquireVoiceSlot() ?: return
+      val slot = acquireVoiceSlot(effectiveCap) ?: return
       val freq = if (ch == 9) {
-        // Percussive short pitched thump for GM Ch 10 in pure sine mode
         midiKeyFreq[key.coerceIn(32, 76)] * 0.8f
       } else {
         midiKeyFreq[key]
@@ -607,7 +692,6 @@ class ZeroGcSynthEngine(
       val panAngle = ((chPan[ch] + 1f) * 0.25f * PI).toFloat()
 
       vChannelKey[slot] = chKey
-      vAge[slot] = ageCounter++
       vIsSine[slot] = true
       vPosInt[slot] = 0
       vPosFrac[slot] = 0f
@@ -616,7 +700,7 @@ class ZeroGcSynthEngine(
 
       vEnvStage[slot] = ENV_ATTACK
       vEnvLevel[slot] = 0f
-      vAttackInc[slot] = 1f / (sampleRate * 0.002f)
+      vAttackInc[slot] = 1f / (sampleRate * 0.0025f)
       if (ch == 9) {
         vDecayDec[slot] = 1f / (sampleRate * 0.09f)
         vSustainLvl[slot] = 0f
@@ -628,7 +712,7 @@ class ZeroGcSynthEngine(
       }
       vGainL[slot] = velGain * cos(panAngle)
       vGainR[slot] = velGain * sin(panAngle)
-      keyActiveCounts[chKey]++
+      linkVoiceToKeyTail(slot, chKey)
       return
     }
 
@@ -639,7 +723,7 @@ class ZeroGcSynthEngine(
       val reg = regions[rIdx]
       if (velocity < reg.loVel || velocity > reg.hiVel) continue
 
-      val slot = acquireVoiceSlot() ?: break
+      val slot = acquireVoiceSlot(effectiveCap) ?: break
       val pitchSemis = (key - reg.rootKey) * reg.scaleTuning + (reg.tuningCents / 100f)
       val rateRatio = (reg.sampleRate.toDouble() / sampleRate.toDouble()) * 2.0.pow(pitchSemis / 12.0)
       val combinedPan = (chPan[ch] + reg.pan).coerceIn(-1f, 1f)
@@ -647,7 +731,6 @@ class ZeroGcSynthEngine(
       val totalGain = velGain * reg.gainLinear
 
       vChannelKey[slot] = chKey
-      vAge[slot] = ageCounter++
       vIsSine[slot] = false
       vBufferIndex[slot] = reg.bufferIndex
       vPosInt[slot] = reg.startFrame
@@ -668,25 +751,28 @@ class ZeroGcSynthEngine(
       vReleaseDec[slot] = max(0.00005f, max(sus, 0.25f) / max(1f, sampleRate * reg.releaseSec))
       vGainL[slot] = totalGain * cos(panAngle)
       vGainR[slot] = totalGain * sin(panAngle)
-      keyActiveCounts[chKey]++
+      linkVoiceToKeyTail(slot, chKey)
     }
   }
 
+  /**
+   * O(1) Note-Off via intrusive per-(channel, key) doubly-linked list!
+   */
   private fun handleNoteOff(ch: Int, key: Int) {
     if (key !in 0..127) return
     val targetChKey = (ch shl 7) or key
     val sustain = chSustainPedal[ch]
-    for (i in 0 until activeCount) {
-      val slot = activeSlots[i]
-      if (vChannelKey[slot] == targetChKey) {
-        val st = vEnvStage[slot]
-        if (st != ENV_RELEASE && st != ENV_FAST_KILL && st != ENV_OFF) {
-          if (sustain) {
-            vHeldBySustain[slot] = true
-          } else {
-            transitionToRelease(slot)
-          }
-        }
+    var slot = keyHeadSlot[targetChKey]
+    if (sustain) {
+      while (slot >= 0) {
+        vHeldBySustain[slot] = true
+        slot = vNextInKey[slot]
+      }
+    } else {
+      while (slot >= 0) {
+        val next = vNextInKey[slot]
+        transitionToRelease(slot)
+        slot = next
       }
     }
   }
@@ -694,78 +780,120 @@ class ZeroGcSynthEngine(
   private fun transitionToRelease(slot: Int) {
     val st = vEnvStage[slot]
     if (st != ENV_RELEASE && st != ENV_FAST_KILL && st != ENV_OFF) {
-      decrementKeyCount(vChannelKey[slot])
+      unlinkVoiceFromKeyList(slot)
       vEnvStage[slot] = ENV_RELEASE
       val cur = max(vEnvLevel[slot], 0.05f)
-      // Ensure release rate scales cleanly from current envelope height
       if (vReleaseDec[slot] < cur / (sampleRate * 4.0f)) {
         vReleaseDec[slot] = cur / (sampleRate * 0.4f)
       }
     }
   }
 
-  private fun fastKillOldestVoiceOnKey(chKey: Int) {
-    var oldestSlot = -1
-    var oldestAge = Long.MAX_VALUE
-    for (i in 0 until activeCount) {
-      val slot = activeSlots[i]
-      if (vChannelKey[slot] == chKey) {
-        val st = vEnvStage[slot]
-        if (st != ENV_RELEASE && st != ENV_FAST_KILL && vAge[slot] < oldestAge) {
-          oldestAge = vAge[slot]
-          oldestSlot = slot
-        }
-      }
-    }
-    if (oldestSlot >= 0) {
-      decrementKeyCount(chKey)
-      vEnvStage[oldestSlot] = ENV_FAST_KILL
-    }
+  /**
+   * O(1) eviction of the oldest active voice on [chKey] via head pointer of doubly-linked list.
+   */
+  private fun fastKillOldestVoiceOnKey(chKey: Int): Boolean {
+    val oldestSlot = keyHeadSlot[chKey]
+    if (oldestSlot < 0) return false
+    unlinkVoiceFromKeyList(oldestSlot)
+    vHeldBySustain[oldestSlot] = false
+    vEnvStage[oldestSlot] = ENV_FAST_KILL
+    return true
   }
 
-  private fun acquireVoiceSlot(): Int? {
-    val cap = maxPolyphony.coerceIn(16, MAX_VOICE_CAPACITY)
-    if (activeCount >= cap || freeCount == 0) {
+  private fun acquireVoiceSlot(effectiveCap: Int): Int? {
+    if (activeCount >= effectiveCap || freeCount == 0) {
       stealBestCandidateVoice(forceImmediate = true)
     }
     if (freeCount == 0) return null
     val slot = freeSlots[--freeCount]
+    vLastOutL[slot] = 0f
+    vLastOutR[slot] = 0f
     activeSlots[activeCount++] = slot
     return slot
   }
 
+  /**
+   * O(1) 12-probe clock tournament voice stealing with 64-sample sum-of-steps anti-click tail.
+   */
   private fun stealBestCandidateVoice(forceImmediate: Boolean) {
     if (activeCount == 0) return
+    val count = activeCount
+    val probes = min(count, STEAL_TOURNAMENT_PROBES)
     var bestIdx = 0
     var bestScore = Float.MAX_VALUE
+    var idx = stealClock % count
 
-    // Prefer stealing quietest releasing/fast-killing voices first, otherwise oldest/quietest voice
-    for (i in 0 until activeCount) {
-      val slot = activeSlots[i]
+    for (p in 0 until probes) {
+      val slot = activeSlots[idx]
       val st = vEnvStage[slot]
       val stateBias = when (st) {
-        ENV_FAST_KILL -> 0.01f
-        ENV_RELEASE -> 0.1f
+        ENV_FAST_KILL -> 0.008f
+        ENV_RELEASE -> 0.08f
+        ENV_ATTACK -> 1.35f
         else -> 1.0f
       }
       val score = vEnvLevel[slot] * stateBias
       if (score < bestScore) {
         bestScore = score
-        bestIdx = i
+        bestIdx = idx
       }
+      idx++
+      if (idx >= count) idx = 0
     }
+    stealClock = idx
 
     val victimSlot = activeSlots[bestIdx]
-    val st = vEnvStage[victimSlot]
-    if (st != ENV_RELEASE && st != ENV_FAST_KILL && st != ENV_OFF) {
-      decrementKeyCount(vChannelKey[victimSlot])
-    }
+    unlinkVoiceFromKeyList(victimSlot)
+    vHeldBySustain[victimSlot] = false
+
     if (forceImmediate) {
+      pendingDeclickL += vLastOutL[victimSlot]
+      pendingDeclickR += vLastOutR[victimSlot]
+      vLastOutL[victimSlot] = 0f
+      vLastOutR[victimSlot] = 0f
       vEnvStage[victimSlot] = ENV_OFF
       releaseSlotAt(bestIdx)
     } else {
       vEnvStage[victimSlot] = ENV_FAST_KILL
     }
+  }
+
+  private fun linkVoiceToKeyTail(slot: Int, chKey: Int) {
+    if (vInKeyList[slot]) unlinkVoiceFromKeyList(slot)
+    val tail = keyTailSlot[chKey]
+    vPrevInKey[slot] = tail
+    vNextInKey[slot] = -1
+    vInKeyList[slot] = true
+    if (tail >= 0) {
+      vNextInKey[tail] = slot
+    } else {
+      keyHeadSlot[chKey] = slot
+    }
+    keyTailSlot[chKey] = slot
+    keyActiveCounts[chKey]++
+  }
+
+  private fun unlinkVoiceFromKeyList(slot: Int) {
+    if (!vInKeyList[slot]) return
+    val chKey = vChannelKey[slot]
+    val prev = vPrevInKey[slot]
+    val next = vNextInKey[slot]
+    if (prev >= 0) {
+      vNextInKey[prev] = next
+    } else {
+      keyHeadSlot[chKey] = next
+    }
+    if (next >= 0) {
+      vPrevInKey[next] = prev
+    } else {
+      keyTailSlot[chKey] = prev
+    }
+    vPrevInKey[slot] = -1
+    vNextInKey[slot] = -1
+    vInKeyList[slot] = false
+    val cur = keyActiveCounts[chKey]
+    if (cur > 0) keyActiveCounts[chKey] = cur - 1
   }
 
   private fun releaseSlotAt(activeIdx: Int) {
@@ -794,10 +922,11 @@ class ZeroGcSynthEngine(
     while (i < activeCount) {
       val slot = activeSlots[i]
       if ((vChannelKey[slot] ushr 7) == ch) {
-        val st = vEnvStage[slot]
-        if (st != ENV_RELEASE && st != ENV_FAST_KILL && st != ENV_OFF) {
-          decrementKeyCount(vChannelKey[slot])
-        }
+        unlinkVoiceFromKeyList(slot)
+        pendingDeclickL += vLastOutL[slot]
+        pendingDeclickR += vLastOutR[slot]
+        vLastOutL[slot] = 0f
+        vLastOutR[slot] = 0f
         vEnvStage[slot] = ENV_OFF
         releaseSlotAt(i)
       } else {
@@ -808,11 +937,21 @@ class ZeroGcSynthEngine(
 
   private fun killAllVoicesImmediate() {
     while (activeCount > 0) {
-      val slot = activeSlots[activeCount - 1]
+      val idx = activeCount - 1
+      val slot = activeSlots[idx]
+      pendingDeclickL += vLastOutL[slot]
+      pendingDeclickR += vLastOutR[slot]
+      vLastOutL[slot] = 0f
+      vLastOutR[slot] = 0f
+      vInKeyList[slot] = false
+      vPrevInKey[slot] = -1
+      vNextInKey[slot] = -1
       vEnvStage[slot] = ENV_OFF
-      releaseSlotAt(activeCount - 1)
+      releaseSlotAt(idx)
     }
     keyActiveCounts.fill(0)
+    keyHeadSlot.fill(-1)
+    keyTailSlot.fill(-1)
   }
 
   private fun resetControllers() {
@@ -826,10 +965,5 @@ class ZeroGcSynthEngine(
       chPitchRatio[ch] = 1f
       chSustainPedal[ch] = false
     }
-  }
-
-  private fun decrementKeyCount(chKey: Int) {
-    val cur = keyActiveCounts[chKey]
-    if (cur > 0) keyActiveCounts[chKey] = cur - 1
   }
 }

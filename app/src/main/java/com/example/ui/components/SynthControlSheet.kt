@@ -75,6 +75,7 @@ fun SynthControlSheet(
   onSineHarmonicsToggle: (Boolean) -> Unit,
   onMasterGainChange: (Float) -> Unit,
   onPlaybackSpeedChange: (Float) -> Unit,
+  onNoteZoomChange: (Float) -> Unit,
 ) {
   val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
 
@@ -264,7 +265,49 @@ fun SynthControlSheet(
 
       HorizontalDivider(color = ObsidianOutline)
 
-      // Section 2: Black MIDI Synth Load & Audio Protection Controls
+      // Section 2: Falling Notes Zoom & Display Controls
+      val windowSeconds = 1.40f / uiState.noteZoom.coerceIn(0.25f, 4.0f)
+      LabeledSliderRow(
+        label = stringResource(R.string.label_note_zoom),
+        valueText = String.format(Locale.US, "%.2fx (表示幅 %.2fs)", uiState.noteZoom, windowSeconds),
+        value = uiState.noteZoom,
+        valueRange = 0.25f..4.0f,
+        onValueChange = { onNoteZoomChange((it * 20f).roundToInt() / 20f) },
+        testTag = "slider_note_zoom",
+      )
+
+      Row(
+        modifier = Modifier
+          .fillMaxWidth()
+          .horizontalScroll(rememberScrollState()),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+      ) {
+        listOf(0.5f, 1.0f, 1.5f, 2.0f, 3.0f).forEach { preset ->
+          FilterChip(
+            selected = kotlin.math.abs(uiState.noteZoom - preset) < 0.04f,
+            onClick = { onNoteZoomChange(preset) },
+            label = {
+              Text(
+                text = String.format(Locale.US, "%.1fx", preset),
+                fontFamily = JetBrainsMonoFamily,
+              )
+            },
+            modifier = Modifier
+              .defaultMinSize(minHeight = 48.dp)
+              .testTag("zoom_preset_${(preset * 10).roundToInt()}"),
+          )
+        }
+      }
+
+      Text(
+        text = stringResource(R.string.hint_pinch_zoom),
+        style = MaterialTheme.typography.labelSmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+      )
+
+      HorizontalDivider(color = ObsidianOutline)
+
+      // Section 3: Black MIDI Synth Load & Audio Protection Controls
       Text(
         text = "Black MIDI 負荷制御・DSP音質保護",
         style = MaterialTheme.typography.titleLarge,

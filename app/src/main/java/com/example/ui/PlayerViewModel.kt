@@ -76,12 +76,14 @@ data class PlayerUiState(
   val peakLeft: Float = 0f,
   val peakRight: Float = 0f,
   val limiterTriggered: Boolean = false,
+  val cpuGuardActive: Boolean = false,
   val maxPolyphony: Int = 1024,
   val velocityThreshold: Int = 4,
   val maxVoicesPerKey: Int = 3,
   val limiterEnabled: Boolean = true,
   val sineRichHarmonics: Boolean = true,
   val masterGain: Float = 1.0f,
+  val noteZoom: Float = 1.0f,
   val visualizerMode: VisualizerMode = VisualizerMode.FALLING_NOTES,
   val landscapeLocked: Boolean = false,
   val recentMidis: List<RecentMidiBookmark> = emptyList(),
@@ -108,6 +110,7 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
   private var activeSf2Resources: MutableList<Closeable> = mutableListOf()
   private var midiLoadAndScanJob: Job? = null
   private var soundBankLoadJob: Job? = null
+  private var noteZoomSaveJob: Job? = null
 
   init {
     synthEngine.startAudioOutput()
@@ -121,6 +124,7 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
         synthEngine.limiterEnabled = saved.limiterEnabled
         synthEngine.sineRichHarmonics = saved.sineRichHarmonics
         synthEngine.masterGain = saved.masterGain
+        sequencer.noteZoom = saved.noteZoom
         sequencer.visualizerMode = saved.visualizerMode
 
         _uiState.update { st ->
@@ -131,6 +135,7 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
             limiterEnabled = saved.limiterEnabled,
             sineRichHarmonics = saved.sineRichHarmonics,
             masterGain = saved.masterGain,
+            noteZoom = saved.noteZoom,
             visualizerMode = saved.visualizerMode,
             landscapeLocked = saved.landscapeLocked,
             recentMidis = saved.recentMidis,
@@ -154,6 +159,7 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
             peakLeft = synthEngine.peakLevelLeft,
             peakRight = synthEngine.peakLevelRight,
             limiterTriggered = synthEngine.limiterActiveTelemetry,
+            cpuGuardActive = synthEngine.cpuGuardActiveTelemetry,
           )
         }
         delay(50L)
@@ -503,6 +509,20 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
     val clamped = speed.coerceIn(0.25f, 2.0f)
     sequencer.playbackSpeed = clamped
     _uiState.update { it.copy(playbackSpeed = clamped) }
+  }
+
+  fun setNoteZoom(zoom: Float) {
+    val clamped = zoom.coerceIn(
+      StreamingMidiSequencer.MIN_NOTE_ZOOM,
+      StreamingMidiSequencer.MAX_NOTE_ZOOM,
+    )
+    sequencer.noteZoom = clamped
+    _uiState.update { it.copy(noteZoom = clamped) }
+    noteZoomSaveJob?.cancel()
+    noteZoomSaveJob = viewModelScope.launch {
+      delay(180L)
+      prefsRepo.setNoteZoom(clamped)
+    }
   }
 
   fun toggleVisualizerMode() {

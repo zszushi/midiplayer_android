@@ -37,6 +37,7 @@ data class PersistedSettings(
   val limiterEnabled: Boolean = true,
   val sineRichHarmonics: Boolean = true,
   val masterGain: Float = 1.0f,
+  val noteZoom: Float = 1.0f,
   val visualizerMode: VisualizerMode = VisualizerMode.FALLING_NOTES,
   val landscapeLocked: Boolean = false,
   val recentMidis: List<RecentMidiBookmark> = emptyList(),
@@ -52,6 +53,7 @@ class PlayerPreferencesRepository(private val context: Context) {
     val LIMITER_ENABLED = booleanPreferencesKey("limiter_enabled")
     val SINE_RICH_HARMONICS = booleanPreferencesKey("sine_rich_harmonics")
     val MASTER_GAIN = floatPreferencesKey("master_gain")
+    val NOTE_ZOOM = floatPreferencesKey("note_zoom")
     val VISUALIZER_MODE = stringPreferencesKey("visualizer_mode")
     val LANDSCAPE_LOCKED = booleanPreferencesKey("landscape_locked")
     val RECENT_MIDIS = stringPreferencesKey("recent_midis_v1")
@@ -71,6 +73,7 @@ class PlayerPreferencesRepository(private val context: Context) {
       limiterEnabled = prefs[Keys.LIMITER_ENABLED] ?: true,
       sineRichHarmonics = prefs[Keys.SINE_RICH_HARMONICS] ?: true,
       masterGain = (prefs[Keys.MASTER_GAIN] ?: 1.0f).coerceIn(0.1f, 2.5f),
+      noteZoom = (prefs[Keys.NOTE_ZOOM] ?: 1.0f).coerceIn(0.25f, 4.0f),
       visualizerMode = mode,
       landscapeLocked = prefs[Keys.LANDSCAPE_LOCKED] ?: false,
       recentMidis = decodeRecentMidis(prefs[Keys.RECENT_MIDIS].orEmpty()),
@@ -94,6 +97,10 @@ class PlayerPreferencesRepository(private val context: Context) {
       sineRichHarmonics?.let { prefs[Keys.SINE_RICH_HARMONICS] = it }
       masterGain?.let { prefs[Keys.MASTER_GAIN] = it }
     }
+  }
+
+  suspend fun setNoteZoom(zoom: Float) {
+    context.obsidianDataStore.edit { it[Keys.NOTE_ZOOM] = zoom.coerceIn(0.25f, 4.0f) }
   }
 
   suspend fun setVisualizerMode(mode: VisualizerMode) {

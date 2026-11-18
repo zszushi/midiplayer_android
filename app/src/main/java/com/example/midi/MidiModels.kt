@@ -148,7 +148,13 @@ class MidiFullIndex(
  * Zero-GC primitive ring buffer holding visible notes for the 60fps Falling-Notes Canvas.
  * Pre-allocates arrays once so rendering millions of notes triggers zero GC pauses.
  */
-class VisualNoteRingBuffer(val capacity: Int = 32768) {
+class VisualNoteRingBuffer(val capacity: Int = 65536) {
+  init {
+    require(capacity > 0 && (capacity and (capacity - 1)) == 0) {
+      "VisualNoteRingBuffer capacity must be a power of 2"
+    }
+  }
+
   private val mask = capacity - 1
   val startMicros = LongArray(capacity)
   val endMicros = LongArray(capacity)
@@ -158,38 +164,70 @@ class VisualNoteRingBuffer(val capacity: Int = 32768) {
   @Volatile var writeCount: Long = 0L
     private set
 
-  // Tracks the latest ring slot per (channel * 128 + key) so Note-Off closes its exact bar in O(1)
+  // Tracks the latest ring slot per (channel * 128 + key) for O(1) Note-Off & song-time coalescing
   private val openSlotByChKey = IntArray(2048) { -1 }
   private val openWriteSeqByChKey = LongArray(2048) { -1L }
+  private val lastSlotByChKey = IntArray(2048) { -1 }
+  private val lastWriteSeqByChKey = LongArray(2048) { -1L }
 
   fun clear() {
     writeCount = 0L
     openSlotByChKey.fill(-1)
     openWriteSeqByChKey.fill(-1L)
+    lastSlotByChKey.fill(-1)
+    lastWriteSeqByChKey.fill(-1L)
   }
 
-  fun onNoteOn(nowMicros: Long, channel: Int, key: Int, velocity: Int, defaultDurationUs: Long = 220_000L) {
+  fun onNoteOn(
+    nowMicros: Long,
+    channel: Int,
+    key: Int,
+    velocity: Int,
+    defaultDurationUs: Long = 220_000L,
+  ) {
     if (key !in 0..127) return
-    val chKey = ((channel and 0x0F) shl 7) or key
+    val ch = channel and 0x0F
+    val vel = velocity and 0x7F
+    val chKey = (ch shl 7) or key
+    val provisionalEnd = nowMicros + 4_000_000L.coerceAtLeast(defaultDurationUs)
 
-    // Close previous still-open note on same channel+key if valid
-    val prevSlot = openSlotByChKey[chKey]
-    val prevSeq = openWriteSeqByChKey[chKey]
-    if (prevSlot >= 0 && writeCount - prevSeq < capacity) {
-      if (endMicros[prevSlot] > nowMicros) {
-        endMicros[prevSlot] = nowMicros
+    // Song-timestamp space coalescing: merge ultra-rapid (<8.5ms) machine-gun retriggers on the
+    // exact same (channel, key) so sub-pixel bars never strobe or exhaust ring capacity.
+    val lastSlot = lastSlotByChKey[chKey]
+    val lastSeq = lastWriteSeqByChKey[chKey]
+    if (lastSlot >= 0 && writeCount - lastSeq < capacity) {
+      val prevStart = startMicros[lastSlot]
+      if (nowMicros >= prevStart && nowMicros - prevStart <= 8_500L) {
+        endMicros[lastSlot] = provisionalEnd
+        val prevVel = (packedMeta[lastSlot] ushr 16) and 0x7F
+        if (vel > prevVel) {
+          packedMeta[lastSlot] = (key and 0x7F) or (ch shl 8) or (vel shl 16)
+        }
+        openSlotByChKey[chKey] = lastSlot
+        openWriteSeqByChKey[chKey] = lastSeq
+        return
+      }
+    }
+
+    // Cleanly terminate previous still-open note on same channel+key so bars never self-overlap
+    val prevOpenSlot = openSlotByChKey[chKey]
+    val prevOpenSeq = openWriteSeqByChKey[chKey]
+    if (prevOpenSlot >= 0 && writeCount - prevOpenSeq < capacity) {
+      if (endMicros[prevOpenSlot] > nowMicros) {
+        endMicros[prevOpenSlot] = maxOf(startMicros[prevOpenSlot] + 9_000L, nowMicros)
       }
     }
 
     val seq = writeCount
-    val slot = (seq.toInt()) and mask
+    val slot = seq.toInt() and mask
     startMicros[slot] = nowMicros
-    // Provisional end timestamp until Note-Off arrives (capped to 4s max visual tail)
-    endMicros[slot] = nowMicros + 4_000_000L.coerceAtLeast(defaultDurationUs)
-    packedMeta[slot] = (key and 0x7F) or ((channel and 0x0F) shl 8) or ((velocity and 0x7F) shl 16)
+    endMicros[slot] = provisionalEnd
+    packedMeta[slot] = (key and 0x7F) or (ch shl 8) or (vel shl 16)
 
     openSlotByChKey[chKey] = slot
     openWriteSeqByChKey[chKey] = seq
+    lastSlotByChKey[chKey] = slot
+    lastWriteSeqByChKey[chKey] = seq
     writeCount = seq + 1L
   }
 
@@ -199,7 +237,7 @@ class VisualNoteRingBuffer(val capacity: Int = 32768) {
     val slot = openSlotByChKey[chKey]
     val seq = openWriteSeqByChKey[chKey]
     if (slot >= 0 && writeCount - seq < capacity) {
-      val minEnd = startMicros[slot] + 25_000L // Minimum 25ms sliver visibility
+      val minEnd = startMicros[slot] + 22_000L // Minimum 22ms note head visibility
       endMicros[slot] = maxOf(minEnd, nowMicros)
       openSlotByChKey[chKey] = -1
     }

@@ -6,6 +6,8 @@ import com.example.audio.ZeroGcSynthEngine
 import com.example.midi.MidiFastScanner
 import com.example.midi.MidiScanProgress
 import com.example.midi.ScanPhase
+import com.example.midi.StreamingMidiSequencer
+import com.example.midi.VisualNoteRingBuffer
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.DataOutputStream
@@ -84,11 +86,50 @@ class ExampleUnitTest {
     repeat(10) {
       synth.enqueueEvent(ZeroGcSynthEngine.packEvent(ZeroGcSynthEngine.CMD_NOTE_ON, 0, 60, 120))
     }
-    // Render enough blocks for fast-killed voices (2.5ms) to finish
+    // Render enough blocks for fast-killed voices (3ms) to finish
     repeat(4) { synth.renderBlock(out, 128) }
     assertTrue(synth.activeVoiceCountTelemetry in 1..2)
     assertTrue(out.any { kotlin.math.abs(it) > 0.001f })
     assertTrue(out.all { it in -1.0f..1.0f })
+
+    // Stress test: 4,000-event Black MIDI burst with O(1) per-key lists & de-click voice stealing
+    for (i in 0 until 4000) {
+      val ch = i and 0x0F
+      val key = 24 + (i % 72)
+      synth.enqueueEvent(ZeroGcSynthEngine.packEvent(ZeroGcSynthEngine.CMD_NOTE_ON, ch, key, 108))
+      if (i % 3 == 0) {
+        synth.enqueueEvent(ZeroGcSynthEngine.packEvent(ZeroGcSynthEngine.CMD_NOTE_OFF, ch, key, 0))
+      }
+    }
+    synth.renderBlock(out, 128)
+    assertTrue(synth.activeVoiceCountTelemetry <= 64)
+    assertTrue(out.all { it.isFinite() && it in -1.0f..1.0f })
+  }
+
+  @Test
+  fun `visual ring buffer coalesces sub-8ms retriggers and sequencer scales lookahead with zoom`() {
+    val ring = VisualNoteRingBuffer(1024)
+    // 5 hits within 6ms on same (ch=0, key=60) coalesce into a single deterministic slot
+    ring.onNoteOn(100_000L, channel = 0, key = 60, velocity = 70)
+    ring.onNoteOn(102_000L, channel = 0, key = 60, velocity = 95)
+    ring.onNoteOn(105_000L, channel = 0, key = 60, velocity = 115)
+    assertEquals(1L, ring.writeCount)
+    assertEquals(115, (ring.packedMeta[0] ushr 16) and 0x7F)
+
+    // Subsequent hit 30ms later allocates a cleanly separated second bar without overlap
+    ring.onNoteOn(135_000L, channel = 0, key = 60, velocity = 100)
+    assertEquals(2L, ring.writeCount)
+    assertTrue(ring.endMicros[0] <= ring.startMicros[1])
+
+    // Dynamic zoom lookahead scaling
+    val synth = ZeroGcSynthEngine(sampleRate = 44100, blockFrames = 256)
+    val seq = StreamingMidiSequencer(synth, ring)
+    seq.noteZoom = 1.0f
+    assertEquals(1_400_000L, seq.currentVisibleWindowMicros())
+    seq.noteZoom = 2.0f
+    assertEquals(700_000L, seq.currentVisibleWindowMicros())
+    seq.noteZoom = 0.25f
+    assertEquals(5_600_000L, seq.currentVisibleWindowMicros())
   }
 
   @Test

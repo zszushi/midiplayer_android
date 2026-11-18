@@ -29,6 +29,12 @@
     <string name="label_sine_harmonics">サイン波に倍音アタックを付加</string>
     <string name="label_master_gain">マスターゲイン</string>
     <string name="label_playback_speed">再生速度</string>
+    <string name="label_note_zoom">ノーツのズーム率</string>
+    <string name="action_zoom_in">ノーツ拡大</string>
+    <string name="action_zoom_out">ノーツ縮小</string>
+    <string name="action_zoom_reset">ズームを1.0xにリセット</string>
+    <string name="hint_pinch_zoom">キャンバス上で2本指ピンチ操作でもズーム変更できます</string>
+    <string name="label_cpu_guard_active">自動負荷保護作動中</string>
     <string name="label_recent_midi">最近開いたMIDI</string>
     <string name="label_recent_soundbanks">最近使った音源</string>
     <string name="empty_state_hint">端末内の巨大な .mid ファイルを選択してください。メモリに全展開せずストリーム再生を開始します。</string>

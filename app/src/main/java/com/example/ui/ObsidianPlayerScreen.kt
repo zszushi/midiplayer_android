@@ -41,17 +41,20 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.LibraryMusic
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.Piano
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material.icons.filled.ScreenLockLandscape
 import androidx.compose.material.icons.filled.ScreenRotation
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.Tune
+import androidx.compose.material.icons.filled.ZoomIn
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -106,7 +109,10 @@ import com.example.ui.theme.ObsidianBg
 import com.example.ui.theme.ObsidianOutline
 import com.example.ui.theme.ObsidianSurface
 import com.example.ui.theme.ObsidianSurfaceContainer
+import com.example.ui.theme.TelemetryAmber
 import com.example.ui.theme.TelemetryEmerald
+import java.util.Locale
+import kotlin.math.roundToInt
 
 @Composable
 fun ObsidianPlayerRoute(
@@ -192,6 +198,7 @@ fun ObsidianPlayerRoute(
         onSineHarmonicsToggle = viewModel::setSineRichHarmonics,
         onMasterGainChange = viewModel::setMasterGain,
         onPlaybackSpeedChange = viewModel::setPlaybackSpeed,
+        onNoteZoomChange = viewModel::setNoteZoom,
       )
     }
   }
@@ -229,30 +236,29 @@ fun ObsidianPlayerContent(
       // Active Player Layout (Immersive Landscape & Adaptive Portrait)
       Box(modifier = Modifier.fillMaxSize()) {
         // Layer 1: Visualizer Surface (Falling Notes + 88 Keys OR Ultra-Light Monitor)
-        Box(
-          modifier = Modifier
-            .fillMaxSize()
-            .clickable(
-              interactionSource = remember { MutableInteractionSource() },
-              indication = null,
-              onClick = { if (isLandscape) hudVisible = !hudVisible },
-            )
-        ) {
-          if (uiState.visualizerMode == VisualizerMode.FALLING_NOTES) {
-            FallingNotesPianoCanvas(
-              sequencer = viewModel.sequencer,
-              visualNotes = viewModel.visualNoteBuffer,
-              activeKeyboardState = viewModel.activeKeyboardState,
-              isPlaying = uiState.isPlaying,
-              modifier = Modifier.fillMaxSize(),
-            )
-          } else {
-            UltraLightTelemetryMonitor(
-              uiState = uiState,
-              isLandscape = isLandscape,
-              modifier = Modifier.fillMaxSize(),
-            )
-          }
+        if (uiState.visualizerMode == VisualizerMode.FALLING_NOTES) {
+          FallingNotesPianoCanvas(
+            sequencer = viewModel.sequencer,
+            visualNotes = viewModel.visualNoteBuffer,
+            activeKeyboardState = viewModel.activeKeyboardState,
+            isPlaying = uiState.isPlaying,
+            noteZoom = uiState.noteZoom,
+            onNoteZoomChange = viewModel::setNoteZoom,
+            onCanvasTap = { if (isLandscape) hudVisible = !hudVisible },
+            modifier = Modifier.fillMaxSize(),
+          )
+        } else {
+          UltraLightTelemetryMonitor(
+            uiState = uiState,
+            isLandscape = isLandscape,
+            modifier = Modifier
+              .fillMaxSize()
+              .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+                onClick = { if (isLandscape) hudVisible = !hudVisible },
+              ),
+          )
         }
 
         // Layer 2: Floating Top Studio HUD Bar
@@ -278,12 +284,26 @@ fun ObsidianPlayerContent(
               onOpenSettings = onOpenSettingsSheet,
             )
 
-            // Compact HUD progress pill when playing while background n/m track scan is still running
-            if (isActivelyScanning && uiState.isPlaying) {
-              CompactScanHudBadge(
-                progress = uiState.scanProgress,
-                modifier = Modifier.align(Alignment.Start),
-              )
+            Row(
+              modifier = Modifier.fillMaxWidth(),
+              horizontalArrangement = Arrangement.SpaceBetween,
+              verticalAlignment = Alignment.CenterVertically,
+            ) {
+              if (isActivelyScanning && uiState.isPlaying) {
+                CompactScanHudBadge(
+                  progress = uiState.scanProgress,
+                  modifier = Modifier.weight(1f, fill = false),
+                )
+              } else {
+                Spacer(modifier = Modifier.width(1.dp))
+              }
+
+              if (uiState.visualizerMode == VisualizerMode.FALLING_NOTES) {
+                NoteZoomQuickPill(
+                  noteZoom = uiState.noteZoom,
+                  onNoteZoomChange = viewModel::setNoteZoom,
+                )
+              }
             }
 
             SoundBankLoadingBanner(progress = uiState.soundBankProgress)
@@ -575,13 +595,14 @@ private fun TopTelemetryHudBar(
           maxLines = 1,
           overflow = TextOverflow.Ellipsis,
         )
+        val guardSuffix = if (uiState.cpuGuardActive) " • GUARD" else ""
         Text(
           text = "NPS ${FormatUtils.formatNumber(uiState.liveNps)} • " +
             "VOX ${uiState.activeVoices}/${uiState.maxPolyphony} • " +
-            uiState.soundBankType.name,
+            uiState.soundBankType.name + guardSuffix,
           style = MaterialTheme.typography.labelSmall,
           fontFamily = JetBrainsMonoFamily,
-          color = ElectricCyan,
+          color = if (uiState.cpuGuardActive) TelemetryAmber else ElectricCyan,
           maxLines = 1,
           overflow = TextOverflow.Ellipsis,
           modifier = Modifier.testTag("hud_telemetry_text"),
@@ -654,6 +675,84 @@ private fun TopTelemetryHudBar(
             tint = ElectricCyan,
           )
         }
+      }
+    }
+  }
+}
+
+@Composable
+private fun NoteZoomQuickPill(
+  noteZoom: Float,
+  onNoteZoomChange: (Float) -> Unit,
+  modifier: Modifier = Modifier,
+) {
+  Surface(
+    modifier = modifier.testTag("hud_zoom_pill"),
+    shape = RoundedCornerShape(24.dp),
+    color = ObsidianSurface.copy(alpha = 0.88f),
+    border = BorderStroke(1.dp, ObsidianOutline.copy(alpha = 0.85f)),
+  ) {
+    Row(
+      verticalAlignment = Alignment.CenterVertically,
+      modifier = Modifier.padding(horizontal = 4.dp),
+    ) {
+      IconButton(
+        onClick = {
+          val stepped = (((noteZoom / 1.25f) * 20f).roundToInt() / 20f).coerceIn(0.25f, 4.0f)
+          onNoteZoomChange(stepped)
+        },
+        modifier = Modifier
+          .size(48.dp)
+          .testTag("zoom_out_button"),
+      ) {
+        Icon(
+          imageVector = Icons.Filled.Remove,
+          contentDescription = stringResource(R.string.action_zoom_out),
+          modifier = Modifier.size(18.dp),
+        )
+      }
+
+      Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+        modifier = Modifier
+          .clip(RoundedCornerShape(12.dp))
+          .clickable(onClickLabel = stringResource(R.string.action_zoom_reset)) {
+            onNoteZoomChange(1.0f)
+          }
+          .defaultMinSize(minWidth = 56.dp, minHeight = 48.dp)
+          .padding(horizontal = 6.dp)
+          .testTag("zoom_reset_button"),
+      ) {
+        Icon(
+          imageVector = Icons.Filled.ZoomIn,
+          contentDescription = null,
+          tint = ElectricCyan,
+          modifier = Modifier.size(15.dp),
+        )
+        Text(
+          text = String.format(Locale.US, "%.2fx", noteZoom),
+          style = MaterialTheme.typography.labelMedium,
+          fontFamily = JetBrainsMonoFamily,
+          color = ElectricCyan,
+          fontWeight = FontWeight.Bold,
+        )
+      }
+
+      IconButton(
+        onClick = {
+          val stepped = (((noteZoom * 1.25f) * 20f).roundToInt() / 20f).coerceIn(0.25f, 4.0f)
+          onNoteZoomChange(stepped)
+        },
+        modifier = Modifier
+          .size(48.dp)
+          .testTag("zoom_in_button"),
+      ) {
+        Icon(
+          imageVector = Icons.Filled.Add,
+          contentDescription = stringResource(R.string.action_zoom_in),
+          modifier = Modifier.size(18.dp),
+        )
       }
     }
   }

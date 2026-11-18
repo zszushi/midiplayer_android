@@ -23,13 +23,16 @@ import kotlin.math.min
  */
 class StreamingMidiSequencer(
   private val synth: ZeroGcSynthEngine,
-  val visualNotes: VisualNoteRingBuffer = VisualNoteRingBuffer(32768),
+  val visualNotes: VisualNoteRingBuffer = VisualNoteRingBuffer(65536),
 ) {
   companion object {
-    private const val SCHED_RING_SIZE = 262144 // Power of 2 (256K scheduled events)
+    const val MIN_NOTE_ZOOM = 0.25f
+    const val MAX_NOTE_ZOOM = 4.0f
+    const val BASE_VISIBLE_WINDOW_US = 1_400_000L // 1.40s waterfall window at 1.0x zoom
+
+    private const val SCHED_RING_SIZE = 524288 // Power of 2 (512K scheduled events for zoomed-out 5.6s window)
     private const val SCHED_RING_MASK = SCHED_RING_SIZE - 1
-    private const val FALLING_LOOKAHEAD_US = 1_500_000L // 1.5s falling waterfall window
-    private const val ULTRA_LIGHT_LOOKAHEAD_US = 25_000L // 25ms tight audio lookahead
+    private const val ULTRA_LIGHT_LOOKAHEAD_US = 30_000L // 30ms tight audio lookahead
   }
 
   private class SessionSource(
@@ -47,7 +50,13 @@ class StreamingMidiSequencer(
   @Volatile var durationMicros: Long = 0L
     private set
   @Volatile var playbackSpeed: Float = 1.0f
+  @Volatile var noteZoom: Float = 1.0f
   @Volatile var visualizerMode: VisualizerMode = VisualizerMode.FALLING_NOTES
+
+  fun currentVisibleWindowMicros(): Long {
+    val z = noteZoom.coerceIn(MIN_NOTE_ZOOM, MAX_NOTE_ZOOM)
+    return (BASE_VISIBLE_WINDOW_US.toDouble() / z.toDouble()).toLong().coerceIn(320_000L, 6_000_000L)
+  }
 
   // Live Telemetry
   @Volatile var liveNps: Int = 0
@@ -507,14 +516,14 @@ class StreamingMidiSequencer(
 
       val mode = visualizerMode
       val lookaheadUs = if (mode == VisualizerMode.FALLING_NOTES) {
-        FALLING_LOOKAHEAD_US
+        currentVisibleWindowMicros() + 180_000L
       } else {
         ULTRA_LIGHT_LOOKAHEAD_US
       }
       val horizonUs = playheadUs + lookaheadUs
 
       // 1. Stream events from K-Way Min-Heap up to horizonUs (bounded by scheduled ring space)
-      var parseQuota = 32768
+      var parseQuota = 65536
       while (heapSize > 0 && parseQuota > 0 && (schedTail - schedHead) < (SCHED_RING_SIZE - 8)) {
         val topTrk = heap[0]
         val evTick = trkNextTick[topTrk]

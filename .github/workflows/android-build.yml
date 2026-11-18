@@ -99,13 +99,12 @@ jobs:
 
           RELEASE_KS="${RUNNER_TEMP}/ci-upload-key.jks"
           if [ -n "$SECRET_KEYSTORE_B64" ] && [ -n "$SECRET_STORE_PASS" ] && [ -n "$SECRET_KEY_PASS" ]; then
-            VALIDATION_KS="${RUNNER_TEMP}/validated-upload-key.p12"
+            VALIDATION_KS="${RUNNER_TEMP}/validated-upload-key.jks"
             if printf '%s' "$SECRET_KEYSTORE_B64" | tr -d '\n\r ' | base64 -d > "$RELEASE_KS" \
-              && keytool -importkeystore -noprompt \
-                -srckeystore "$RELEASE_KS" -srcstoretype JKS \
-                -srcstorepass "$SECRET_STORE_PASS" -srcalias upload -srckeypass "$SECRET_KEY_PASS" \
-                -destkeystore "$VALIDATION_KS" -deststoretype PKCS12 \
-                -deststorepass validation-only >/dev/null 2>&1; then
+              && cp "$RELEASE_KS" "$VALIDATION_KS" \
+              && keytool -keypasswd -alias upload -keystore "$VALIDATION_KS" \
+                -storepass "$SECRET_STORE_PASS" -keypass "$SECRET_KEY_PASS" \
+                -new validation-only-key >/dev/null 2>&1; then
               rm -f "$VALIDATION_KS"
               echo "Using the configured release keystore."
               echo "KEYSTORE_PATH=$RELEASE_KS" >> "$GITHUB_ENV"

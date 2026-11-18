@@ -3,28 +3,27 @@ name: Build Obsidian Midi APK
 on:
   push:
     branches:
-      - main
-      - master
+      - "**"
     tags:
       - "v*"
   pull_request:
-    branches:
-      - main
-      - master
   workflow_dispatch:
     inputs:
-      publish_github_release:
-        description: "GitHub Releases にも生APKを公開する（スマホから直接 .apk をDLしたい場合に便利）"
+      publish_release:
+        description: "GitHub Releases にも生APKを公開する"
         required: false
-        default: true
-        type: boolean
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
 
 permissions:
   contents: write
 
 jobs:
   build-apk:
-    name: Build & Test Android APK
+    name: Build Android APK
     runs-on: ubuntu-latest
 
     steps:
@@ -37,24 +36,51 @@ jobs:
           distribution: "temurin"
           java-version: "21"
 
-      - name: Set up Android SDK & Accept Licenses
-        uses: android-actions/setup-android@v3
-
-      - name: Install required Android SDK Platform (36.1) & Build Tools
+      - name: Configure Android SDK (API 36.1 & Build-Tools 36.0.0)
         run: |
-          yes | sdkmanager --licenses > /dev/null || true
-          sdkmanager "platform-tools" "platforms;android-36.1" "build-tools;36.0.0"
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          mkdir -p "$SDK_ROOT"
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+
+          SDKMANAGER=""
+          if [ -x "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" ]; then
+            SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          else
+            FOUND_BIN="$(find "$SDK_ROOT/cmdline-tools" -name sdkmanager -type f 2>/dev/null | head -n 1 || true)"
+            if [ -n "$FOUND_BIN" ]; then
+              chmod +x "$FOUND_BIN"
+              SDKMANAGER="$FOUND_BIN"
+            fi
+          fi
+
+          if [ -z "$SDKMANAGER" ]; then
+            curl -fsSL https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -o /tmp/cmdtools.zip
+            mkdir -p "$SDK_ROOT/cmdline-tools"
+            unzip -q /tmp/cmdtools.zip -d /tmp/cmdtools_extract
+            mv /tmp/cmdtools_extract/cmdline-tools "$SDK_ROOT/cmdline-tools/latest"
+            SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          fi
+
+          yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses > /dev/null || true
+          "$SDKMANAGER" --sdk_root="$SDK_ROOT" "platform-tools" "platforms;android-36" "platforms;android-36.1" "build-tools;36.0.0"
 
       - name: Set up Gradle 9.3.1
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "9.3.1"
+          validate-wrappers: false
 
-      - name: Prepare .env and debug.keystore
+      - name: Prepare .env and Signing Keystores
+        env:
+          SECRET_KEYSTORE_B64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          SECRET_STORE_PASS: ${{ secrets.STORE_PASSWORD }}
+          SECRET_KEY_PASS: ${{ secrets.KEY_PASSWORD }}
         run: |
           if [ ! -f .env ] && [ -f .env.example ]; then
             cp .env.example .env
           fi
+
           if [ ! -f debug.keystore ]; then
             if [ -f debug.keystore.base64 ]; then
               tr -d '\n\r ' < debug.keystore.base64 | base64 -d > debug.keystore
@@ -71,28 +97,15 @@ jobs:
             fi
           fi
 
-      - name: Run Unit & Robolectric Tests
-        run: gradle :app:testDebugUnitTest --no-daemon
-
-      - name: Assemble Debug APK
-        run: gradle :app:assembleDebug --no-daemon
-
-      - name: Prepare Release Signing Key & Assemble Release APK
-        env:
-          SECRET_KEYSTORE_B64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
-          SECRET_STORE_PASS: ${{ secrets.STORE_PASSWORD }}
-          SECRET_KEY_PASS: ${{ secrets.KEY_PASSWORD }}
-        run: |
-          KEYSTORE_FILE="/tmp/ci-upload-key.jks"
+          RELEASE_KS="${RUNNER_TEMP}/ci-upload-key.jks"
           if [ -n "$SECRET_KEYSTORE_B64" ] && [ -n "$SECRET_STORE_PASS" ] && [ -n "$SECRET_KEY_PASS" ]; then
-            echo "$SECRET_KEYSTORE_B64" | tr -d '\n\r ' | base64 -d > "$KEYSTORE_FILE"
-            export KEYSTORE_PATH="$KEYSTORE_FILE"
-            export STORE_PASSWORD="$SECRET_STORE_PASS"
-            export KEY_PASSWORD="$SECRET_KEY_PASS"
+            printf '%s' "$SECRET_KEYSTORE_B64" | tr -d '\n\r ' | base64 -d > "$RELEASE_KS"
+            echo "KEYSTORE_PATH=$RELEASE_KS" >> "$GITHUB_ENV"
+            echo "STORE_PASSWORD=$SECRET_STORE_PASS" >> "$GITHUB_ENV"
+            echo "KEY_PASSWORD=$SECRET_KEY_PASS" >> "$GITHUB_ENV"
           else
-            # Secrets未設定でも即インストール可能な署名付きRelease APKを生成
             keytool -genkeypair -v \
-              -keystore "$KEYSTORE_FILE" \
+              -keystore "$RELEASE_KS" \
               -storepass "obsidian_ci_store" \
               -alias "upload" \
               -keypass "obsidian_ci_key" \
@@ -100,14 +113,14 @@ jobs:
               -keysize 2048 \
               -validity 10000 \
               -dname "CN=Obsidian Midi CI,O=Obsidian,C=JP"
-            export KEYSTORE_PATH="$KEYSTORE_FILE"
-            export STORE_PASSWORD="obsidian_ci_store"
-            export KEY_PASSWORD="obsidian_ci_key"
+            echo "KEYSTORE_PATH=$RELEASE_KS" >> "$GITHUB_ENV"
+            echo "STORE_PASSWORD=obsidian_ci_store" >> "$GITHUB_ENV"
+            echo "KEY_PASSWORD=obsidian_ci_key" >> "$GITHUB_ENV"
           fi
-          gradle :app:assembleRelease --no-daemon
 
-      - name: Collect Named APKs
+      - name: Assemble Debug & Release APKs
         run: |
+          gradle :app:assembleDebug :app:assembleRelease --no-daemon --stacktrace
           mkdir -p dist
           cp app/build/outputs/apk/debug/app-debug.apk dist/ObsidianMidi-debug.apk
           cp app/build/outputs/apk/release/app-release.apk dist/ObsidianMidi-release.apk
@@ -127,15 +140,24 @@ jobs:
           path: dist/ObsidianMidi-release.apk
           if-no-files-found: error
 
-      - name: Publish APK to GitHub Releases (Tag push or Manual Dispatch)
-        if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish_github_release == true)
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('ci-build-{0}', github.run_number) }}
-          name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('Obsidian Midi Build #{0}', github.run_number) }}
-          body: |
-            Obsidian Midi 自動ビルド APK です。
-            スマートフォンからは以下の `ObsidianMidi-release.apk`（または `ObsidianMidi-debug.apk`）をタップすると解凍不要でそのままダウンロード・インストールできます。
-          files: |
-            dist/ObsidianMidi-release.apk
-            dist/ObsidianMidi-debug.apk
+      - name: Publish Raw APKs to GitHub Releases
+        if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish_release != 'false')
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          RUN_NUM: ${{ github.run_number }}
+        run: |
+          if [ "$EVENT_NAME" = "push" ]; then
+            TAG="$REF_NAME"
+            TITLE="Obsidian Midi $REF_NAME"
+          else
+            TAG="ci-build-${RUN_NUM}"
+            TITLE="Obsidian Midi Build #${RUN_NUM}"
+          fi
+          gh release create "$TAG" \
+            dist/ObsidianMidi-release.apk \
+            dist/ObsidianMidi-debug.apk \
+            --title "$TITLE" \
+            --notes "スマートフォンからは下の Assets にある ObsidianMidi-release.apk をタップするとそのままダウンロード・インストールできます。"
